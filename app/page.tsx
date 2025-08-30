@@ -33,10 +33,11 @@ export default function CoastalDashboard() {
 
         {/* Main Content Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left Column - Charts and Map */}
+          {/* Left Column - Charts, Map, and Email Subscription */}
           <div className="lg:col-span-2 space-y-6">
             <GeoMap enabledTypes={enabledTypes} />
             <SensorCategories onToggle={setEnabledTypes} />
+            <EmailSubscription />
           </div>
 
           {/* Right Column - Alerts and Status */}
@@ -44,7 +45,6 @@ export default function CoastalDashboard() {
             <RealTimeStatus />
             <AlertsPanel />
             <RecentAlerts />
-            <EmailSubscription />
           </div>
         </div>
       </main>

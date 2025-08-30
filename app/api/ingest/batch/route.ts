@@ -1,115 +1,243 @@
-import { createClient } from "@/lib/supabase/server"
 import { NextResponse } from "next/server"
+import { createClient } from "@/lib/supabase/server"
 import { detectAnomalies } from "@/lib/anomaly-detection/detector"
 
-interface BatchSensorData {
-  sensor_id: string
-  readings: Array<{
-    value: number
-    unit: string
-    timestamp?: string
-    quality_score?: number
-  }>
+interface WeatherData {
+  wind_speed: number
+  temperature: number
+  humidity: number
+  pressure: number
+  visibility: number
+  description: string
 }
 
-export async function POST(request: Request) {
+interface MarineData {
+  wave_height: number
+  timestamp: string
+}
+
+async function fetchWeatherData(lat: number, lon: number, apiKey: string): Promise<WeatherData | null> {
   try {
-    const body = await request.json()
-    const { data }: { data: BatchSensorData[] } = body
-
-    if (!Array.isArray(data) || data.length === 0) {
-      return NextResponse.json({ error: "Invalid batch data format" }, { status: 400 })
+    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&units=metric`
+    
+    const response = await fetch(url, { 
+      cache: "no-store",
+      headers: {
+        'User-Agent': 'CoastCare/1.0'
+      }
+    })
+    
+    if (!response.ok) {
+      console.error(`OpenWeather API error: ${response.status} ${response.statusText}`)
+      return null
     }
+    
+    const data = await response.json()
+    
+    return {
+      wind_speed: Number(data?.wind?.speed ?? 0),
+      temperature: Number(data?.main?.temp ?? 0),
+      humidity: Number(data?.main?.humidity ?? 0),
+      pressure: Number(data?.main?.pressure ?? 0),
+      visibility: Number(data?.visibility ?? 0),
+      description: data?.weather?.[0]?.description ?? "Unknown"
+    }
+  } catch (error) {
+    console.error(`Error fetching weather data for ${lat},${lon}:`, error)
+    return null
+  }
+}
 
-    if (data.length > 1000) {
-      return NextResponse.json({ error: "Batch size too large (max 1000 readings)" }, { status: 400 })
+async function fetchMarineData(lat: number, lon: number): Promise<MarineData | null> {
+  try {
+    const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height`
+    
+    const response = await fetch(url, { cache: "no-store" })
+    if (!response.ok) {
+      console.error(`Marine API error: ${response.status} ${response.statusText}`)
+      return null
+    }
+    
+    const data = await response.json()
+    const times: string[] = data?.hourly?.time || []
+    const heights: number[] = data?.hourly?.wave_height || []
+    
+    if (!times.length || !heights.length) {
+      return null
+    }
+    
+    // Take the most recent available value
+    const lastIdx = times.length - 1
+    const valueMeters = Number(heights[lastIdx] ?? 0)
+    const timestamp = times[lastIdx]
+    
+    return {
+      wave_height: valueMeters,
+      timestamp
+    }
+  } catch (error) {
+    console.error(`Error fetching marine data for ${lat},${lon}:`, error)
+    return null
+  }
+}
+
+export async function POST() {
+  try {
+    const apiKey = process.env.OPENWEATHER_API_KEY
+    if (!apiKey) {
+      return NextResponse.json({ 
+        error: "OPENWEATHER_API_KEY not configured",
+        message: "Please set OPENWEATHER_API_KEY environment variable"
+      }, { status: 500 })
     }
 
     const supabase = await createClient()
-    const results = []
-    const errors = []
 
-    for (const batch of data) {
-      try {
-        // Verify sensor exists and is active
-        const { data: sensor, error: sensorError } = await supabase
-          .from("coastal_sensors")
-          .select("*")
-          .eq("id", batch.sensor_id)
-          .eq("status", "active")
+    // Get all active sensors
+    const { data: sensors, error: sensorsError } = await supabase
+      .from("coastal_sensors")
+      .select("id,name,location,latitude,longitude,sensor_type,status")
+      .eq("status", "active")
+      .in("sensor_type", ["wind_speed", "temperature", "wave_height"] as any)
+
+    if (sensorsError) {
+      console.error("Error fetching sensors:", sensorsError)
+      return NextResponse.json({ error: "Failed to fetch sensors" }, { status: 500 })
+    }
+
+    if (!sensors || sensors.length === 0) {
+      return NextResponse.json({ 
+        success: true, 
+        inserted: 0, 
+        message: "No active sensors found" 
+      })
+    }
+
+    // Group sensors by coordinates to minimize API calls
+    const coordToSensors = new Map<string, any[]>()
+    for (const sensor of sensors) {
+      const key = `${sensor.latitude.toFixed(4)},${sensor.longitude.toFixed(4)}`
+      const arr = coordToSensors.get(key) || []
+      arr.push(sensor)
+      coordToSensors.set(key, arr)
+    }
+
+    const results: { 
+      coordinate: string
+      success: boolean
+      readings_inserted: number
+      alerts_generated: number
+      error?: string
+    }[] = []
+
+    // Process each unique coordinate
+    for (const [coordKey, sensorGroup] of coordToSensors.entries()) {
+      const [latStr, lonStr] = coordKey.split(",")
+      const lat = Number(latStr)
+      const lon = Number(lonStr)
+
+      let readingsInserted = 0
+      let alertsGenerated = 0
+
+      // Fetch weather data (wind and temperature)
+      const weatherData = await fetchWeatherData(lat, lon, apiKey)
+      
+      // Fetch marine data (wave height)
+      const marineData = await fetchMarineData(lat, lon)
+
+      // Process each sensor at this coordinate
+      for (const sensor of sensorGroup) {
+        let value: number
+        let unit: string
+        let timestamp: string
+
+        if (sensor.sensor_type === "wind_speed") {
+          if (!weatherData) continue
+          // Convert m/s to mph for consistency with UI thresholds
+          value = Number((weatherData.wind_speed * 2.2369362921).toFixed(2))
+          unit = "mph"
+          timestamp = new Date().toISOString()
+        } else if (sensor.sensor_type === "temperature") {
+          if (!weatherData) continue
+          value = Number(weatherData.temperature.toFixed(2))
+          unit = "celsius"
+          timestamp = new Date().toISOString()
+        } else if (sensor.sensor_type === "wave_height") {
+          if (!marineData) continue
+          value = Number(marineData.wave_height.toFixed(2))
+          unit = "meters"
+          timestamp = new Date(marineData.timestamp).toISOString()
+        } else {
+          continue // Skip unsupported sensor types
+        }
+
+        // Check for recent duplicate readings (within last 5 minutes)
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+        const { data: recentReadings } = await supabase
+          .from("sensor_readings")
+          .select("id")
+          .eq("sensor_id", sensor.id)
+          .gte("timestamp", fiveMinutesAgo)
+          .limit(1)
+
+        // Skip if we already have a recent reading for this sensor
+        if (recentReadings && recentReadings.length > 0) {
+          console.log(`Skipping duplicate reading for sensor ${sensor.id}`)
+          continue
+        }
+
+        // Insert the reading
+        const { data: reading, error: insertError } = await supabase
+          .from("sensor_readings")
+          .insert({
+            sensor_id: sensor.id,
+            value,
+            unit,
+            timestamp,
+            quality_score: 1.0,
+          })
+          .select()
           .single()
 
-        if (sensorError || !sensor) {
-          errors.push({ sensor_id: batch.sensor_id, error: "Sensor not found or inactive" })
-          continue
-        }
-
-        // Prepare readings for batch insert
-        const readingsToInsert = batch.readings.map((reading) => ({
-          sensor_id: batch.sensor_id,
-          value: reading.value,
-          unit: reading.unit,
-          timestamp: reading.timestamp || new Date().toISOString(),
-          quality_score: reading.quality_score || 1.0,
-        }))
-
-        // Validate readings
-        const invalidReadings = readingsToInsert.filter(
-          (r) =>
-            typeof r.value !== "number" ||
-            r.value < -1000 ||
-            r.value > 1000 ||
-            r.quality_score < 0 ||
-            r.quality_score > 1,
-        )
-
-        if (invalidReadings.length > 0) {
-          errors.push({ sensor_id: batch.sensor_id, error: "Invalid reading values detected" })
-          continue
-        }
-
-        // Insert readings
-        const { data: insertedReadings, error: insertError } = await supabase
-          .from("sensor_readings")
-          .insert(readingsToInsert)
-          .select()
-
         if (insertError) {
-          console.error("Batch insert error:", insertError)
-          errors.push({ sensor_id: batch.sensor_id, error: "Failed to insert readings" })
+          console.error(`Error inserting reading for sensor ${sensor.id}:`, insertError)
           continue
         }
 
-        // Run anomaly detection on the latest reading
-        if (insertedReadings && insertedReadings.length > 0) {
-          const latestReading = insertedReadings[insertedReadings.length - 1]
-          try {
-            await detectAnomalies(sensor, latestReading)
-          } catch (anomalyError) {
-            console.error("Anomaly detection error:", anomalyError)
-          }
-        }
+        readingsInserted++
 
-        results.push({
-          sensor_id: batch.sensor_id,
-          inserted_count: insertedReadings?.length || 0,
-          success: true,
-        })
-      } catch (error) {
-        console.error("Batch processing error:", error)
-        errors.push({ sensor_id: batch.sensor_id, error: "Processing failed" })
+        // Run anomaly detection on the new reading
+        try {
+          const alerts = await detectAnomalies(sensor, reading)
+          alertsGenerated += alerts.length
+        } catch (anomalyError) {
+          console.error(`Error in anomaly detection for sensor ${sensor.id}:`, anomalyError)
+        }
       }
+
+      results.push({
+        coordinate: coordKey,
+        success: true,
+        readings_inserted: readingsInserted,
+        alerts_generated: alertsGenerated
+      })
+
+      // Add small delay between coordinate groups to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100))
     }
+
+    const totalInserted = results.reduce((sum, r) => sum + r.readings_inserted, 0)
+    const totalAlerts = results.reduce((sum, r) => sum + r.alerts_generated, 0)
 
     return NextResponse.json({
       success: true,
-      processed: results.length,
-      errors: errors.length,
       results,
-      errors,
+      total_readings_inserted: totalInserted,
+      total_alerts_generated: totalAlerts,
+      timestamp: new Date().toISOString()
     })
   } catch (error) {
-    console.error("Batch ingestion error:", error)
+    console.error("Batch ingest error:", error)
     return NextResponse.json({ error: "Internal server error" }, { status: 500 })
   }
 }
